@@ -34,33 +34,69 @@ pub(crate) struct Cfg {
   pub(crate) skip_prejoin_screen: Option<bool>,
   #[serde(default)]
   pub(crate) group: String,
+  #[serde(default = "default_jwt_max_age_seconds")]
+  pub(crate) jwt_max_age_seconds: i64,
+  #[serde(default = "default_session_max_age_seconds")]
+  pub(crate) session_max_age_seconds: i64,
+  #[serde(default = "default_http_timeout_seconds")]
+  pub(crate) http_timeout_seconds: u64,
+  #[serde(default = "default_http_connect_timeout_seconds")]
+  pub(crate) http_connect_timeout_seconds: u64,
+  #[serde(default)]
+  #[serde(deserialize_with = "string_array2")]
+  pub(crate) trusted_id_token_audiences: Option<Vec<String>>,
+  #[serde(default)]
+  #[serde(deserialize_with = "path_array")]
+  pub(crate) ca_certificate_files: Option<Vec<PathBuf>>,
+  #[serde(default)]
+  pub(crate) ca_certificate_file: Option<PathBuf>,
 }
 
 fn default_listen_addr() -> SocketAddr {
   ([127, 0, 0, 1], 3000).into()
 }
 
-/// Serializes an OffsetDateTime to a Unix timestamp (milliseconds since 1970/1/1T00:00:00T)
+fn default_session_max_age_seconds() -> i64 {
+  30 * 60
+}
+
+fn default_jwt_max_age_seconds() -> i64 {
+  5 * 60
+}
+
+fn default_http_timeout_seconds() -> u64 {
+  15
+}
+
+fn default_http_connect_timeout_seconds() -> u64 {
+  5
+}
+
+pub fn path_array<'a, D: Deserializer<'a>>(
+  deserializer: D,
+) -> Result<Option<Vec<PathBuf>>, D::Error> {
+  let input: Option<String> = Option::deserialize(deserializer)?;
+
+  Ok(input.map(|input| input.split(' ').map(PathBuf::from).collect()))
+}
+
 pub fn string_array2<'a, D: Deserializer<'a>>(
   deserializer: D,
 ) -> Result<Option<Vec<String>>, D::Error> {
-  let input: String = Deserialize::deserialize(deserializer)?;
+  let input: Option<String> = Option::deserialize(deserializer)?;
 
-  let values = input.split(' ').map(|acr| acr.to_string()).collect();
-
-  Ok(Some(values))
+  Ok(input.map(|input| input.split(' ').map(|acr| acr.to_string()).collect()))
 }
 
-/// Serializes an OffsetDateTime to a Unix timestamp (milliseconds since 1970/1/1T00:00:00T)
 pub fn string_array<'a, D: Deserializer<'a>>(
   deserializer: D,
 ) -> Result<Option<Vec<AuthenticationContextClass>>, D::Error> {
-  let input: String = Deserialize::deserialize(deserializer)?;
+  let input: Option<String> = Option::deserialize(deserializer)?;
 
-  let values = input
-    .split(' ')
-    .map(|acr| AuthenticationContextClass::new(acr.to_string()))
-    .collect();
-
-  Ok(Some(values))
+  Ok(input.map(|input| {
+    input
+      .split(' ')
+      .map(|acr| AuthenticationContextClass::new(acr.to_string()))
+      .collect()
+  }))
 }

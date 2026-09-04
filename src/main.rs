@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use config::{Config, Environment};
 use openidconnect::core::{
@@ -43,6 +45,7 @@ struct Session {
   csrf_token: CsrfToken,
   nonce: Nonce,
   pkce_verifier: PkceCodeVerifier,
+  expires_at: time::OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -124,11 +127,7 @@ async fn main() -> anyhow::Result<()> {
     *config.client_id
   );
 
-  let http_client = reqwest::ClientBuilder::new()
-    // Following redirects opens the client up to SSRF vulnerabilities.
-    .redirect(reqwest::redirect::Policy::none())
-    .build()
-    .expect("Client should build");
+  let http_client = build_http_client(&config)?;
 
   let provider_metadata: CoreProviderMetadata =
     CoreProviderMetadata::discover_async(config.issuer_url.clone(), &http_client).await?;
@@ -186,6 +185,30 @@ async fn main() -> anyhow::Result<()> {
   axum::serve(listener, app.into_make_service()).await?;
 
   Ok(())
+}
+
+fn build_http_client(config: &Cfg) -> anyhow::Result<reqwest::Client> {
+  let mut builder = reqwest::ClientBuilder::new()
+    // Following redirects opens the client up to SSRF vulnerabilities.
+    .redirect(reqwest::redirect::Policy::none())
+    .connect_timeout(Duration::from_secs(config.http_connect_timeout_seconds))
+    .timeout(Duration::from_secs(config.http_timeout_seconds));
+
+  for path in ca_certificate_files(config) {
+    let certificate = reqwest::Certificate::from_pem(&std::fs::read(&path)?)?;
+    builder = builder.add_root_certificate(certificate);
+  }
+
+  Ok(builder.build()?)
+}
+
+fn ca_certificate_files(config: &Cfg) -> Vec<PathBuf> {
+  config
+    .ca_certificate_file
+    .iter()
+    .cloned()
+    .chain(config.ca_certificate_files.clone().unwrap_or_default())
+    .collect()
 }
 
 // async fn shutdown_signal() {

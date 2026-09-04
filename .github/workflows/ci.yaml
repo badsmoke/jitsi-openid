@@ -11,8 +11,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
   build:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
 
     strategy:
       matrix:
@@ -42,7 +53,7 @@ jobs:
         #run: wget -cO - https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz | tar -xz
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
           #run: ./cross build --release --target ${{ matrix.target }}
 
       - name: Rename binary
@@ -60,11 +71,10 @@ jobs:
           files: jitsi-openid_${{ matrix.target }}
 
   docker:
-    needs: build
+    needs:
+      - test
+      - build
     runs-on: ubuntu-latest
-
-    permissions:
-      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -74,14 +84,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ github.repository }}
-            marcelcoding/jitsi-openid
+            badsmoke/jitsi-openid
           tags: |
             type=edge
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -93,14 +103,6 @@ jobs:
           key: ${{ runner.os }}-buildx-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-buildx-
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3

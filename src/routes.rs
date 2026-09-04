@@ -2,7 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use axum::Router;
-use axum_extra::extract::cookie::Cookie;
+use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
 use jsonwebtoken::{EncodingKey, Header};
 use openidconnect::core::{CoreAuthenticationFlow, CoreGenderClaim};
@@ -14,6 +14,7 @@ use serde::{self, Serializer};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tracing::{error, warn};
+use url::Url;
 use uuid::Uuid;
 
 use crate::AppError::{AuthenticationContextWasNotFulfilled, IdTokenRequired};
@@ -70,13 +71,19 @@ async fn room(
   let (auth_url, csrf_token, nonce) = request.url();
 
   let session_id = Uuid::new_v4();
-  state.store.write().await.insert(
+  let session_max_age = Duration::seconds(state.config.session_max_age_seconds);
+  let expires_at = OffsetDateTime::now_utc() + session_max_age;
+
+  let mut store = state.store.write().await;
+  prune_expired_sessions(&mut store);
+  store.insert(
     session_id,
     Session {
       room,
       csrf_token,
       nonce,
       pkce_verifier,
+      expires_at,
     },
   );
 
@@ -93,7 +100,8 @@ async fn room(
     .path(state.config.base_url.path().to_string())
     .secure(state.config.base_url.scheme() == "https")
     .http_only(true)
-    .max_age(Duration::minutes(30));
+    .same_site(SameSite::Lax)
+    .max_age(session_max_age);
 
   (jar.add(cookie), Redirect::to(auth_url.as_str()))
 }
@@ -124,6 +132,10 @@ async fn callback(
     None => return Err(InvalidSession),
   };
 
+  if session.expires_at <= OffsetDateTime::now_utc() {
+    return Err(InvalidSession);
+  }
+
   if &callback.state != session.csrf_token.secret() {
     return Err(InvalidState);
   }
@@ -143,29 +155,31 @@ async fn callback(
       InvalidCode
     })?;
 
-  let jitsi_user = match id_token_claims(&state.config, &state.client, &response, &session.nonce)? {
-    None => match user_info_claims(&state.client, &state.http_client, &response).await? {
-      None => return Err(MissingIdTokenAndUserInfoEndpoint),
+  let jitsi_user =
+    match id_token_claims(&state.config, &state.client, &response, &session.nonce)? {
+      None => match user_info_claims(&state.client, &state.http_client, &response).await? {
+        None => return Err(MissingIdTokenAndUserInfoEndpoint),
+        Some(user) => user,
+      },
       Some(user) => user,
-    },
-    Some(user) => user,
-  };
+    };
 
   let jwt = create_jitsi_jwt(
     jitsi_user,
     "jitsi".to_string(),
     "jitsi".to_string(),
     state.config.jitsi_sub,
-    "*".to_string(),
+    session.room.clone(),
     state.jitsi_secret.0,
     state.config.group,
+    state.config.jwt_max_age_seconds,
   )
   .map_err(|err| {
     error!("Unable to create jwt: {}", err);
     InternalServerError
   })?;
 
-  let mut url = state.config.jitsi_url.join(&session.room).unwrap();
+  let mut url = create_jitsi_room_url(&state.config.jitsi_url, &session.room)?;
   url.query_pairs_mut().append_pair("jwt", &jwt);
 
   if state.config.skip_prejoin_screen.unwrap_or(true) {
@@ -173,6 +187,22 @@ async fn callback(
   }
 
   Ok(Redirect::to(url.as_str()))
+}
+
+fn create_jitsi_room_url(jitsi_url: &Url, room: &str) -> Result<Url, AppError> {
+  let mut url = jitsi_url.clone();
+  url.set_query(None);
+  url.set_fragment(None);
+  {
+    let mut segments = url.path_segments_mut().map_err(|_| InternalServerError)?;
+    segments.push(room);
+  }
+  Ok(url)
+}
+
+fn prune_expired_sessions(store: &mut std::collections::HashMap<Uuid, Session>) {
+  let now = OffsetDateTime::now_utc();
+  store.retain(|_, session| session.expires_at > now);
 }
 
 fn id_token_claims(
@@ -192,9 +222,16 @@ fn id_token_claims(
     }
   };
 
-  let id_token_verifier = client
-    .id_token_verifier()
-    .set_other_audience_verifier_fn(|_aud| true);
+  let id_token_verifier = match &config.trusted_id_token_audiences {
+    Some(trusted_audiences) => client
+      .id_token_verifier()
+      .set_other_audience_verifier_fn(|aud| {
+        trusted_audiences
+          .iter()
+          .any(|trusted_audience| **aud == trusted_audience.as_str())
+      }),
+    None => client.id_token_verifier(),
+  };
   let claims = id_token
     .claims(&id_token_verifier, nonce)
     .map_err(InvalidIdTokenNonce)?;
@@ -246,13 +283,8 @@ fn id_token_claims(
     };
   }
 
-  let uid = match claims.preferred_username() {
-    Some(name) => name.to_string(),
-    None => claims.subject().to_string(),
-  };
-
   Ok(Some(JitsiUser {
-    id: uid,
+    id: claims.subject().to_string(),
     email: claims.email().map(|email| email.to_string()),
     affiliation: claims.additional_claims().affiliation.clone(),
     name: get_display_name_id_token(claims),
@@ -277,10 +309,7 @@ async fn user_info_claims(
       })?;
 
       Ok(Some(JitsiUser {
-        id: match claims.preferred_username() {
-          Some(name) => name.to_string(),
-          None => claims.subject().to_string(),
-        },
+        id: claims.subject().to_string(),
         email: claims.email().map(|email| email.to_string()),
         affiliation: claims.additional_claims().affiliation.clone(),
         name: get_display_name(&claims),
@@ -338,9 +367,10 @@ fn create_jitsi_jwt(
   room: String,
   secret: String,
   group: String,
+  max_age_seconds: i64,
 ) -> anyhow::Result<String> {
   let iat = OffsetDateTime::now_utc();
-  let exp = iat + Duration::days(1);
+  let exp = iat + Duration::seconds(max_age_seconds);
 
   let context = JitsiContext {
     user,
@@ -377,7 +407,9 @@ pub fn jwt_numeric_date<S: Serializer>(
   serializer.serialize_i64(timestamp)
 }
 
-fn get_display_name_id_token(claims: &IdTokenClaims<MyClaims, CoreGenderClaim>) -> Option<String> {
+fn get_display_name_id_token(
+  claims: &IdTokenClaims<MyClaims, CoreGenderClaim>,
+) -> Option<String> {
   if let Some(name) = claims
     .name()
     .or_else(|| claims.name())
@@ -451,4 +483,99 @@ fn get_display_name(claims: &MyUserInfoClaims) -> Option<String> {
   }
 
   claims.preferred_username().map(|name| name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use jsonwebtoken::{decode, DecodingKey, Validation};
+  use serde_json::Value;
+  use url::Url;
+
+  use super::{create_jitsi_jwt, create_jitsi_room_url, JitsiUser};
+
+  #[test]
+  fn jitsi_jwt_uses_stable_user_id_and_requested_room() {
+    let token = create_jitsi_jwt(
+      JitsiUser {
+        id: "stable-subject".to_string(),
+        email: Some("user@example.com".to_string()),
+        affiliation: None,
+        name: Some("Display Name".to_string()),
+        avatar: None,
+        moderator: None,
+      },
+      "jitsi".to_string(),
+      "jitsi".to_string(),
+      "meet.example.com".to_string(),
+      "Räksmörgås".to_string(),
+      "secret".to_string(),
+      "group".to_string(),
+      300,
+    )
+    .expect("jwt should be created");
+
+    let mut validation = Validation::default();
+    validation.set_audience(&["jitsi"]);
+
+    let claims = decode::<Value>(
+      &token,
+      &DecodingKey::from_secret("secret".as_bytes()),
+      &validation,
+    )
+    .expect("jwt should decode")
+    .claims;
+
+    assert_eq!(claims["room"], "Räksmörgås");
+    assert_eq!(claims["context"]["user"]["id"], "stable-subject");
+  }
+
+  #[test]
+  fn jitsi_room_url_keeps_configured_host_for_url_like_room_names() {
+    let base = Url::parse("https://meet.example.com/base").expect("valid base url");
+
+    let absolute = create_jitsi_room_url(&base, "https://evil.example/room")
+      .expect("room url should be created");
+    assert_eq!(absolute.host_str(), Some("meet.example.com"));
+    assert_eq!(absolute.path(), "/base/https:%2F%2Fevil.example%2Froom");
+
+    let scheme_relative =
+      create_jitsi_room_url(&base, "//evil.example/room").expect("room url should be created");
+    assert_eq!(scheme_relative.host_str(), Some("meet.example.com"));
+    assert_eq!(scheme_relative.path(), "/base/%2F%2Fevil.example%2Froom");
+  }
+
+  #[test]
+  fn jitsi_jwt_expiry_uses_configured_max_age() {
+    let token = create_jitsi_jwt(
+      JitsiUser {
+        id: "stable-subject".to_string(),
+        email: None,
+        affiliation: None,
+        name: None,
+        avatar: None,
+        moderator: None,
+      },
+      "jitsi".to_string(),
+      "jitsi".to_string(),
+      "meet.example.com".to_string(),
+      "room".to_string(),
+      "secret".to_string(),
+      "group".to_string(),
+      42,
+    )
+    .expect("jwt should be created");
+
+    let mut validation = Validation::default();
+    validation.set_audience(&["jitsi"]);
+
+    let claims = decode::<Value>(
+      &token,
+      &DecodingKey::from_secret("secret".as_bytes()),
+      &validation,
+    )
+    .expect("jwt should decode")
+    .claims;
+
+    assert_eq!(claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(), 42);
+  }
 }

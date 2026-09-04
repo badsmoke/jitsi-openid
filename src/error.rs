@@ -2,6 +2,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use openidconnect::ClaimsVerificationError;
 
+#[derive(Debug)]
 pub(crate) enum AppError {
   InvalidSession,
   InvalidCode,

@@ -3,15 +3,19 @@
 Jitsi OpenID is an authentication adapter to provide [jitsi](https://jitsi.org/) the ability to use single sign on
 via [OpenID Connect](https://openid.net/connect/).
 
+This repository is a maintained fork of the original
+[MarcelCoding/jitsi-openid](https://github.com/MarcelCoding/jitsi-openid) project, which was archived upstream.
+The goal of this fork is to keep the adapter maintained with dependency updates, compatibility fixes, and security
+hardening.
+
 ## Deployment
 
 **This guide is based of the [docker setup from jitsi](https://github.com/jitsi/docker-jitsi-meet/).**
 
-This image is available in the
-[GitHub Container Registry](https://github.com/users/MarcelCoding/packages/container/package/jitsi-openid):
+The maintained Docker image is:
 
 ```
-ghcr.io/marcelcoding/jitsi-openid:latest
+badsmoke/jitsi-openid:latest
 ```
 
 ### Docker "run" Command
@@ -27,7 +31,7 @@ docker run \
   -e CLIENT_ID=meet.example.com \
   -e CLIENT_SECRET=SECURE_SECRET \
   --rm \
-  ghcr.io/marcelcoding/jitsi-openid:latest
+  badsmoke/jitsi-openid:latest
 ```
 
 ### Docker Compose
@@ -41,7 +45,7 @@ services:
   # ...
 
   jitsi-openid:
-    image: ghcr.io/marcelcoding/jitsi-openid:latest
+    image: badsmoke/jitsi-openid:latest
     restart: always
     environment:
       - "JITSI_SECRET=SECURE_SECRET" # <- shared with jitsi (JWT_APP_SECRET -> see .env from jitsi),
@@ -64,6 +68,15 @@ services:
         # - 'SKIP_PREJOIN_SCREEN=false'              # <- skips the jitsi prejoin screen after login (default: true)
         # - 'GROUP=example'                          # <- Value for the 'group' field in the token
         #    default: ''
+        # - 'JWT_MAX_AGE_SECONDS=300'                # <- Lifetime of generated Jitsi JWTs
+        # - 'SESSION_MAX_AGE_SECONDS=1800'           # <- Session lifetime before callback must finish
+        # - 'HTTP_TIMEOUT_SECONDS=15'                # <- Total timeout for IDP HTTP requests
+        # - 'HTTP_CONNECT_TIMEOUT_SECONDS=5'         # <- Connect timeout for IDP HTTP requests
+        # - 'TRUSTED_ID_TOKEN_AUDIENCES=api other'   # <- Additional trusted ID token audiences
+        #    default: reject additional audiences
+        # - 'CA_CERTIFICATE_FILE=/certs/root-ca.pem' # <- Optional extra PEM CA certificate for private IDPs
+        # - 'CA_CERTIFICATE_FILES=/certs/a.pem /certs/b.pem'
+        #    Optional space separated PEM CA certificate files
     ports:
       - "3000:3000"
 # ...
@@ -73,50 +86,6 @@ To generate the `JITSI_SECRET` you can use one of the following command:
 
 ```bash
 cat /dev/urandom | tr -dc a-zA-Z0-9 | head -c128; echo
-```
-
-### NixOS
-
-```nix
-{
-  inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-23.11";
-    jitsi-openid = {
-      url = "github:MarcelCoding/jitsi-openid";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-  };
-
-  outputs = { self, nixpkgs, jitsi-openid, ... }: {
-    nixosConfigurations = {
-      hostname = nixpkgs.lib.nixosSystem {
-        modules = [
-          jitsi-openid.nixosModules.default
-          { nixpkgs.overlays = [ jitsi-openid.overlays.default ]; }
-        ];
-      };
-    };
-  };
-}
-```
-
-```nix
-# for an explanation see docker compose setup
-services.jitsi-openid = {
-  enable = true;
-  listen = {
-    addr = "::1";
-    port = 6031;
-  };
-  jitsiSecretFile = "/run/secrets/jitsi-secret-file";
-  jitsiUrl = "https://meet.domain.tld";
-  jitsiSub = "meet.domain.tld";
-  issuerUrl = "https://auth.domain.tld";
-  baseUrl = "https://auth.meet.domain.tld";
-  clientId = "auth.meet.domain.tld";
-  clientSecretFile = "/run/secrets/client-secret-file";
-  openFirewall = false;
-};
 ```
 
 ### Jitsi Configuration
@@ -151,90 +120,15 @@ JWT_ACCEPTED_AUDIENCES=jitsi
 TOKEN_AUTH_URL=https://auth.meet.example.com/room/{room}
 ```
 
-### Jitsi Configuration NixOS
-
-The following NixOS config shows how to use JWT Auth with the jitsi NixOS module.
-The necessary steps where extracted form [docker-jitsi-meet](https://github.com/jitsi/docker-jitsi-meet):
-
-```nix
-{
-  pkgs,
-  config,
-  ...
-}:
-
-let
-  hostName = "meet.example.com";
-  ssoHostName = "auth-meet.example.com";
-  ssoPort = 3000;
-  ssoAddress = "127.0.0.1";
-  cfg = config.services.jitsi-meet;
-in
-{
-  networking.firewall.allowedUDPPorts = [ 10000 ]; # required for more then 2 participants
-
-  # this assumes jitsi openid is already running on the server on port 3000
-  # you could run it with e.g. virtualisation.oci-containers.containers
-  services.nginx.virtualHosts.${ssoHostName} = {
-    forceSSL = true;
-    enableACME = true;
-    locations = {
-      "/" = {
-        proxyPass = "http://${ssoAddress}:${toString ssoPort}";
-      };
-    };
-  };
-
-  nixpkgs.config.permittedInsecurePackages = [
-    "jitsi-meet-1.0.8043"
-  ];
-
-  services.jitsi-meet = {
-    enable = true;
-
-    inherit hostName;
-    nginx.enable = true;
-    secureDomain = {
-      enable = true;
-      authentication = "token";
-    };
-
-    config.tokenAuthUrl = "https://${ssoHostName}/room/{room}";
-  };
-
-  services.prosody = {
-    extraModules = [
-      "token_verification"
-    ];
-
-    extraConfig = ''
-      asap_accepted_issuers = "jitsi"
-      asap_accepted_audiences = "jitsi"
-    '';
-
-    virtualHosts.${cfg.hostName} = {
-      # a secure secret should be used for production
-      extraConfig = ''
-        app_secret = "insecure_secret"
-        app_id = "jitsi"
-      '';
-    };
-  };
-
-  systemd.services.prosody.environment = {
-    # the token_verification module has some more lua dependencies
-    LUA_PATH = "${pkgs.lua52Packages.basexx}/share/lua/5.2/?.lua;${pkgs.lua52Packages.cjson}/share/lua/5.2/?.lua;${pkgs.lua52Packages.luaossl}/share/lua/5.2/?.lua;${pkgs.lua52Packages.inspect}/share/lua/5.2/?.lua";
-    LUA_CPATH = "${pkgs.lua52Packages.cjson}/lib/lua/5.2/?.so;${pkgs.lua52Packages.luaossl}/lib/lua/5.2/?.so";
-  };
-}
-```
-
 ### Jitsi JWTs
 
 The JWTs are populated using the data returned by your IDP.
 This includes the user id, email and name.
 
-The `sub` extracted from the `prefered_username` field, if that isn't preset the `sub` field is used.
+The user id is extracted from the OpenID Connect `sub` claim.
+
+The generated Jitsi JWT is scoped to the requested room and expires after `JWT_MAX_AGE_SECONDS`.
+The default lifetime is 300 seconds.
 
 The `name` is extracted from the `name` field, if that isn't preset a concatenation of `given_name`, `middle_name`
 and `family_name` is used. If all tree of them are also not present the `prefered_username` is used.
@@ -247,6 +141,26 @@ The picture (avatar) URL is delegated from the IDP to Jitsi.
 
 Translations aren't respected: https://github.com/MarcelCoding/jitsi-openid/issues/117#issuecomment-1172406703
 
+### Security Notes
+
+Room names are appended to `JITSI_URL` as encoded path segments, so URL-like room names cannot redirect users away from
+the configured Jitsi host.
+
+ID tokens must contain this application's client id as an audience. Additional audiences are rejected unless they are
+listed in `TRUSTED_ID_TOKEN_AUDIENCES`.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## Contact
+
+For issues or contributions, open an issue in the repository or reach out via email.
+
+github@badcloud.eu
+
 ## License
+
+This fork remains licensed under the GNU Affero General Public License v3.0, matching the original project.
 
 [LICENSE](LICENSE)
